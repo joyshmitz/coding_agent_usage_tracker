@@ -143,6 +143,7 @@ pub(crate) enum CredentialsSource {
     /// `<claude_dir>/.credentials.json`.
     File,
     /// The macOS login Keychain (`Claude Code-credentials`).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     MacosKeychain,
 }
 
@@ -189,21 +190,19 @@ fn read_macos_keychain_payload() -> Option<String> {
         .filter(|u| !u.trim().is_empty());
 
     // Prefer the current user's account; fall back to any account.
-    let accounts: [Option<&str>; 2] = [user.as_deref(), None];
-    for account in accounts {
+    for account in [user.as_deref(), None] {
         if let Some(payload) = security_cli_find_generic_password(account) {
             tracing::debug!(
-                account = account.is_some(),
+                user_account = account.is_some(),
                 "Read Claude Code credentials from the macOS Keychain via `security`"
             );
             return Some(payload);
         }
     }
-    for account in [user.as_deref(), Some("")] {
-        let Some(account) = account else { continue };
+    for account in user.as_deref().into_iter().chain(std::iter::once("")) {
         if let Some(payload) = keyring_find_generic_password(account) {
             tracing::debug!(
-                account = !account.is_empty(),
+                user_account = !account.is_empty(),
                 "Read Claude Code credentials from the macOS Keychain via keyring"
             );
             return Some(payload);
