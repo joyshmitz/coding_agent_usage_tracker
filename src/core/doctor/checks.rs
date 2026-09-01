@@ -8,6 +8,7 @@ use crate::core::cli_runner::run_command;
 use crate::core::credential_health::{AuthHealthAggregator, OverallHealth};
 use crate::core::provider::Provider;
 use crate::error::CautError;
+use crate::providers::claude;
 use std::time::{Duration, Instant};
 
 /// Default timeout for API reachability checks.
@@ -138,81 +139,78 @@ pub async fn check_authenticated(provider: Provider) -> DiagnosticCheck {
 }
 
 /// Check Claude authentication.
+///
+/// Reads the credentials payload from wherever Claude Code stored it:
+/// `<claude_dir>/.credentials.json` (honoring `CLAUDE_CONFIG_DIR`) or, on
+/// macOS, the login Keychain item `Claude Code-credentials`. A file-only probe
+/// told every macOS user to re-authenticate even though the CLI was logged in
+/// and usage fetching worked. See issue #10.
 async fn check_claude_auth() -> CheckStatus {
-    let Some(home) = dirs::home_dir() else {
+    let Some((source, content)) = claude::read_credentials_payload() else {
+        let reason = if cfg!(target_os = "macos") {
+            "No credentials found (checked .credentials.json and the macOS Keychain)"
+        } else {
+            "No credentials file found"
+        };
         return CheckStatus::Fail {
-            reason: "Cannot determine home directory".to_string(),
-            suggestion: None,
+            reason: reason.to_string(),
+            suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
+        };
+    };
+    claude_auth_status_from_payload(source, &content)
+}
+
+/// Classify a Claude credentials payload (the `.credentials.json` schema)
+/// into a doctor status.
+fn claude_auth_status_from_payload(source: claude::CredentialsSource, content: &str) -> CheckStatus {
+    let json: serde_json::Value = match serde_json::from_str(content) {
+        Ok(json) => json,
+        Err(e) => {
+            return CheckStatus::Fail {
+                reason: format!("Credentials in {} invalid: {e}", source.label()),
+                suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
+            };
+        }
+    };
+
+    // Claude's credentials payload uses top-level keys:
+    //   "claudeAiOauth" (main auth with accessToken, subscriptionType, etc.)
+    //   "mcpOAuth" (MCP plugin OAuth tokens)
+    let Some(oauth) = json.get("claudeAiOauth") else {
+        // No primary Claude OAuth; check for MCP-only auth
+        let reason = if json.get("mcpOAuth").is_some() {
+            "Only MCP OAuth found, no primary Claude auth".to_string()
+        } else {
+            "Invalid credentials format (no claudeAiOauth key)".to_string()
+        };
+        return CheckStatus::Fail {
+            reason,
+            suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
         };
     };
 
-    let creds_path = home.join(".claude").join(".credentials.json");
+    // Extract subscription type for richer status
+    let sub_type = oauth
+        .get("subscriptionType")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+    let has_token = oauth
+        .get("accessToken")
+        .and_then(|t| t.as_str())
+        .is_some_and(|s| !s.is_empty());
 
-    if !creds_path.exists() {
-        return CheckStatus::Fail {
-            reason: "No credentials file found".to_string(),
+    if has_token {
+        CheckStatus::Pass {
+            details: Some(format!(
+                "Authenticated via OAuth (plan: {sub_type}, source: {})",
+                source.label()
+            )),
+        }
+    } else {
+        CheckStatus::Fail {
+            reason: "OAuth entry present but access token missing".to_string(),
             suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
-        };
-    }
-
-    // Try to read and validate credentials
-    match std::fs::read_to_string(&creds_path) {
-        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(json) => {
-                // Claude's .credentials.json uses top-level keys:
-                //   "claudeAiOauth" (main auth with accessToken, subscriptionType, etc.)
-                //   "mcpOAuth" (MCP plugin OAuth tokens)
-                json.get("claudeAiOauth").map_or_else(
-                    || {
-                        // No primary Claude OAuth; check for MCP-only auth
-                        if json.get("mcpOAuth").is_some() {
-                            CheckStatus::Fail {
-                                reason: "Only MCP OAuth found, no primary Claude auth".to_string(),
-                                suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
-                            }
-                        } else {
-                            CheckStatus::Fail {
-                                reason: "Invalid credentials format (no claudeAiOauth key)"
-                                    .to_string(),
-                                suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
-                            }
-                        }
-                    },
-                    |oauth| {
-                        // Extract subscription type for richer status
-                        let sub_type = oauth
-                            .get("subscriptionType")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("unknown");
-                        let has_token = oauth
-                            .get("accessToken")
-                            .and_then(|t| t.as_str())
-                            .is_some_and(|s| !s.is_empty());
-
-                        if has_token {
-                            CheckStatus::Pass {
-                                details: Some(format!(
-                                    "Authenticated via OAuth (plan: {sub_type})"
-                                )),
-                            }
-                        } else {
-                            CheckStatus::Fail {
-                                reason: "OAuth entry present but access token missing".to_string(),
-                                suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
-                            }
-                        }
-                    },
-                )
-            }
-            Err(e) => CheckStatus::Fail {
-                reason: format!("Credentials file invalid: {e}"),
-                suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
-            },
-        },
-        Err(e) => CheckStatus::Fail {
-            reason: format!("Failed to read credentials: {e}"),
-            suggestion: Some(Provider::Claude.auth_suggestion().to_string()),
-        },
+        }
     }
 }
 
@@ -519,6 +517,44 @@ mod dirs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_auth_status_keychain_payload_with_zero_expiry_passes() {
+        // Claude Code on macOS stores this in the Keychain; `expiresAt: 0`
+        // is a sentinel, not a stale token. See issue #10.
+        let payload = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-x","expiresAt":0,"subscriptionType":"max"},"mcpOAuth":{}}"#;
+        match claude_auth_status_from_payload(claude::CredentialsSource::MacosKeychain, payload) {
+            CheckStatus::Pass { details } => {
+                let details = details.expect("details");
+                assert!(details.contains("plan: max"), "{details}");
+                assert!(details.contains("macOS Keychain"), "{details}");
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_auth_status_reports_source_and_failures() {
+        let file = claude::CredentialsSource::File;
+        match claude_auth_status_from_payload(file, r#"{"mcpOAuth":{"s":{}}}"#) {
+            CheckStatus::Fail { reason, .. } => assert!(reason.contains("Only MCP OAuth"), "{reason}"),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        match claude_auth_status_from_payload(file, r#"{"claudeAiOauth":{"accessToken":""}}"#) {
+            CheckStatus::Fail { reason, .. } => assert!(reason.contains("access token missing"), "{reason}"),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        match claude_auth_status_from_payload(file, "not json") {
+            CheckStatus::Fail { reason, .. } => {
+                assert!(reason.contains("credentials file"), "{reason}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        match claude_auth_status_from_payload(file, r#"{"foo":1}"#) {
+            CheckStatus::Fail { reason, .. } => assert!(reason.contains("no claudeAiOauth"), "{reason}"),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
 
     #[test]
     fn extract_version_from_output() {

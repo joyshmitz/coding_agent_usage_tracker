@@ -97,7 +97,8 @@ fn has_oauth_token() -> bool {
 ///    same JSON payload as the credentials file).
 ///
 /// Tokens whose `claudeAiOauth.expiresAt` (epoch milliseconds) is in the past
-/// are skipped. See issue #8.
+/// are skipped; a missing, zero, or negative `expiresAt` is a "no expiry
+/// recorded" sentinel and the token is used. See issues #8 and #10.
 pub(crate) fn get_oauth_token() -> Option<String> {
     get_keyring_token()
         .or_else(get_credentials_file_token)
@@ -112,9 +113,14 @@ fn get_keyring_token() -> Option<String> {
 
 /// Get OAuth token from Claude Code's `.credentials.json`.
 fn get_credentials_file_token() -> Option<String> {
-    let creds_path = get_claude_dir()?.join(".credentials.json");
-    let content = fs::read_to_string(creds_path).ok()?;
+    let content = read_credentials_file()?;
     token_from_credentials_json(&content)
+}
+
+/// Read the raw contents of `<claude_dir>/.credentials.json`, if present.
+fn read_credentials_file() -> Option<String> {
+    let creds_path = get_claude_dir()?.join(".credentials.json");
+    fs::read_to_string(creds_path).ok()
 }
 
 /// On macOS, extract an OAuth token from the `Claude Code-credentials`
@@ -122,22 +128,140 @@ fn get_credentials_file_token() -> Option<String> {
 /// installs write to `.credentials.json`.
 #[cfg(target_os = "macos")]
 fn get_macos_keychain_token() -> Option<String> {
-    let user = std::env::var("USER").ok();
-    let try_entry = |account: &str| -> Option<String> {
-        keyring::Entry::new("Claude Code-credentials", account)
-            .ok()?
-            .get_password()
-            .ok()
-    };
-    let payload = user
-        .as_deref()
-        .and_then(try_entry)
-        .or_else(|| try_entry(""))?;
+    let payload = read_macos_keychain_payload()?;
     token_from_credentials_json(&payload)
 }
 
 #[cfg(not(target_os = "macos"))]
 const fn get_macos_keychain_token() -> Option<String> {
+    None
+}
+
+/// Where a Claude credentials payload was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialsSource {
+    /// `<claude_dir>/.credentials.json`.
+    File,
+    /// The macOS login Keychain (`Claude Code-credentials`).
+    MacosKeychain,
+}
+
+impl CredentialsSource {
+    /// Human-readable label for diagnostics.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::File => "credentials file",
+            Self::MacosKeychain => "macOS Keychain",
+        }
+    }
+}
+
+/// Read Claude Code's raw credentials JSON payload from wherever the CLI
+/// stored it: the credentials file first, then (macOS only) the Keychain.
+///
+/// Used by `caut doctor`, which previously only looked at the file and so
+/// told every macOS user to re-authenticate. See issue #10.
+pub(crate) fn read_credentials_payload() -> Option<(CredentialsSource, String)> {
+    if let Some(content) = read_credentials_file() {
+        return Some((CredentialsSource::File, content));
+    }
+    read_macos_keychain_payload().map(|payload| (CredentialsSource::MacosKeychain, payload))
+}
+
+/// The Keychain service name Claude Code uses for its OAuth credentials.
+#[cfg(target_os = "macos")]
+const MACOS_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Read the raw JSON payload Claude Code stores in the macOS login Keychain.
+///
+/// Claude Code writes the item with the `security` CLI, so `/usr/bin/security`
+/// is the only application on the item's access-control list. An in-process
+/// Security.framework lookup (what the `keyring` crate does) from a different
+/// binary is therefore not trusted by the item: depending on the session it
+/// either fails outright or would pop a Keychain consent dialog. Reading
+/// through the same `security find-generic-password` tool Claude Code uses
+/// works without any prompt, so that is tried first and the `keyring` crate
+/// is kept as a fallback for items whose ACL does allow it. See issue #10.
+#[cfg(target_os = "macos")]
+fn read_macos_keychain_payload() -> Option<String> {
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.trim().is_empty());
+
+    // Prefer the current user's account; fall back to any account.
+    let accounts: [Option<&str>; 2] = [user.as_deref(), None];
+    for account in accounts {
+        if let Some(payload) = security_cli_find_generic_password(account) {
+            tracing::debug!(
+                account = account.is_some(),
+                "Read Claude Code credentials from the macOS Keychain via `security`"
+            );
+            return Some(payload);
+        }
+    }
+    for account in [user.as_deref(), Some("")] {
+        let Some(account) = account else { continue };
+        if let Some(payload) = keyring_find_generic_password(account) {
+            tracing::debug!(
+                account = !account.is_empty(),
+                "Read Claude Code credentials from the macOS Keychain via keyring"
+            );
+            return Some(payload);
+        }
+    }
+    tracing::debug!("No readable Claude Code credentials in the macOS Keychain");
+    None
+}
+
+/// Run `security find-generic-password -s <service> [-a <account>] -w` and
+/// return the stored secret, if any. Never logs the secret.
+#[cfg(target_os = "macos")]
+fn security_cli_find_generic_password(account: Option<&str>) -> Option<String> {
+    let mut cmd = std::process::Command::new("/usr/bin/security");
+    cmd.arg("find-generic-password").arg("-s").arg(MACOS_KEYCHAIN_SERVICE);
+    if let Some(account) = account {
+        cmd.arg("-a").arg(account);
+    }
+    cmd.arg("-w");
+    cmd.stdin(std::process::Stdio::null());
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(err) => {
+            tracing::debug!(error = %err, "Could not run `security find-generic-password`");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::debug!(
+            status = %output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "`security find-generic-password` did not return the Claude Code item"
+        );
+        return None;
+    }
+    let payload = String::from_utf8(output.stdout).ok()?;
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return None;
+    }
+    Some(payload.to_string())
+}
+
+/// Read the Keychain item through the `keyring` crate (Security.framework).
+#[cfg(target_os = "macos")]
+fn keyring_find_generic_password(account: &str) -> Option<String> {
+    match keyring::Entry::new(MACOS_KEYCHAIN_SERVICE, account).and_then(|e| e.get_password()) {
+        Ok(payload) if !payload.trim().is_empty() => Some(payload),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::debug!(error = %err, "keyring lookup of the Claude Code item failed");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn read_macos_keychain_payload() -> Option<String> {
     None
 }
 
@@ -184,22 +308,8 @@ fn has_local_config() -> bool {
 
 /// On macOS, look up the Claude Code keychain entry. Returns false on other
 /// platforms and on lookup failure.
-#[cfg(target_os = "macos")]
 fn macos_keychain_has_claude_credentials() -> bool {
-    // Prefer the current-user keychain; fall back to the generic entry.
-    let user = std::env::var("USER").ok();
-    let try_entry = |account: &str| -> bool {
-        keyring::Entry::new("Claude Code-credentials", account)
-            .ok()
-            .and_then(|e| e.get_password().ok())
-            .is_some_and(|s| !s.is_empty())
-    };
-    user.as_deref().is_some_and(try_entry) || try_entry("")
-}
-
-#[cfg(not(target_os = "macos"))]
-const fn macos_keychain_has_claude_credentials() -> bool {
-    false
+    read_macos_keychain_payload().is_some()
 }
 
 /// Shape of Claude Code's `.credentials.json` (and the macOS Keychain
@@ -227,16 +337,33 @@ struct ClaudeOauthCredentials {
 /// Extract a non-expired access token from a credentials JSON payload
 /// (`claudeAiOauth.accessToken`, honoring `claudeAiOauth.expiresAt`).
 fn token_from_credentials_json(content: &str) -> Option<String> {
+    token_from_credentials_json_at(content, Utc::now().timestamp_millis())
+}
+
+/// [`token_from_credentials_json`] with an injectable clock (epoch ms).
+fn token_from_credentials_json_at(content: &str, now_ms: i64) -> Option<String> {
     let creds: ClaudeCredentialsFile = serde_json::from_str(content).ok()?;
     let oauth = creds.claude_ai_oauth?;
     let token = oauth.access_token.filter(|t| !t.is_empty())?;
-    if let Some(expires_at_ms) = oauth.expires_at
-        && expires_at_ms <= Utc::now().timestamp_millis()
-    {
+    if oauth_token_is_expired(oauth.expires_at, now_ms) {
         tracing::debug!("Claude OAuth token is expired (expiresAt in the past), skipping");
         return None;
     }
     Some(token)
+}
+
+/// Whether a `claudeAiOauth.expiresAt` value (epoch ms) says the token is
+/// stale at `now_ms`.
+///
+/// Claude Code writes `expiresAt: 0` when it manages refresh itself (the real
+/// deadline then lives in `refreshTokenExpiresAt`). Zero and negative values
+/// are therefore sentinels meaning "no expiry recorded", not timestamps in
+/// 1970 — treat them like a missing field. See issue #10.
+const fn oauth_token_is_expired(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
+    match expires_at_ms {
+        Some(expires_at_ms) if expires_at_ms > 0 => expires_at_ms <= now_ms,
+        _ => false,
+    }
 }
 
 /// Shape of Claude Code's main config (`~/.claude.json`): account identity
@@ -900,6 +1027,41 @@ mod tests {
             token_from_credentials_json(content).as_deref(),
             Some("sk-ant-oat01-no-expiry")
         );
+    }
+
+    #[test]
+    fn token_from_credentials_json_treats_zero_expiry_as_sentinel() {
+        // Claude Code writes `expiresAt: 0` when it handles refresh itself;
+        // the real deadline sits in `refreshTokenExpiresAt`. See issue #10.
+        let content = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-zero","expiresAt":0,"refreshTokenExpiresAt":1790727709073,"subscriptionType":"max"}}"#;
+
+        assert_eq!(
+            token_from_credentials_json(content).as_deref(),
+            Some("sk-ant-oat01-zero")
+        );
+    }
+
+    #[test]
+    fn oauth_token_is_expired_sentinels_and_boundaries() {
+        let now = 1_700_000_000_000;
+        assert!(!oauth_token_is_expired(None, now));
+        assert!(!oauth_token_is_expired(Some(0), now));
+        assert!(!oauth_token_is_expired(Some(-1), now));
+        assert!(!oauth_token_is_expired(Some(i64::MIN), now));
+        assert!(!oauth_token_is_expired(Some(now + 1), now));
+        assert!(oauth_token_is_expired(Some(now), now));
+        assert!(oauth_token_is_expired(Some(now - 1), now));
+        assert!(oauth_token_is_expired(Some(1), now));
+    }
+
+    #[test]
+    fn token_from_credentials_json_at_uses_injected_clock() {
+        let content = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-clock","expiresAt":1000}}"#;
+        assert_eq!(
+            token_from_credentials_json_at(content, 999).as_deref(),
+            Some("sk-ant-oat01-clock")
+        );
+        assert!(token_from_credentials_json_at(content, 1000).is_none());
     }
 
     #[test]
