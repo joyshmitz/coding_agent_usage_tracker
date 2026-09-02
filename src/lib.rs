@@ -7,8 +7,12 @@
 #![deny(unsafe_code)]
 #![warn(clippy::pedantic, clippy::nursery)]
 #![allow(clippy::module_name_repetitions)]
-// Allow async functions without await - stub functions will use async when implemented
-#![allow(clippy::unused_async)]
+// Allow async functions without await - stub functions will use async when implemented.
+// `unused_async_trait_impl` is the newer nightly-only sibling lint for `async fn`s in
+// trait impls (e.g. the cost scanner); `unknown_lints` keeps older nightlies from
+// tripping on the name.
+#![allow(unknown_lints)]
+#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]
 
 pub mod cli;
 pub mod core;

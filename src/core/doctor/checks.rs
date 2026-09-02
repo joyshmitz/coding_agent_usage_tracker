@@ -162,7 +162,10 @@ async fn check_claude_auth() -> CheckStatus {
 
 /// Classify a Claude credentials payload (the `.credentials.json` schema)
 /// into a doctor status.
-fn claude_auth_status_from_payload(source: claude::CredentialsSource, content: &str) -> CheckStatus {
+fn claude_auth_status_from_payload(
+    source: claude::CredentialsSource,
+    content: &str,
+) -> CheckStatus {
     let json: serde_json::Value = match serde_json::from_str(content) {
         Ok(json) => json,
         Err(e) => {
@@ -537,11 +540,15 @@ mod tests {
     fn claude_auth_status_reports_source_and_failures() {
         let file = claude::CredentialsSource::File;
         match claude_auth_status_from_payload(file, r#"{"mcpOAuth":{"s":{}}}"#) {
-            CheckStatus::Fail { reason, .. } => assert!(reason.contains("Only MCP OAuth"), "{reason}"),
+            CheckStatus::Fail { reason, .. } => {
+                assert!(reason.contains("Only MCP OAuth"), "{reason}")
+            }
             other => panic!("expected Fail, got {other:?}"),
         }
         match claude_auth_status_from_payload(file, r#"{"claudeAiOauth":{"accessToken":""}}"#) {
-            CheckStatus::Fail { reason, .. } => assert!(reason.contains("access token missing"), "{reason}"),
+            CheckStatus::Fail { reason, .. } => {
+                assert!(reason.contains("access token missing"), "{reason}")
+            }
             other => panic!("expected Fail, got {other:?}"),
         }
         match claude_auth_status_from_payload(file, "not json") {
@@ -551,7 +558,9 @@ mod tests {
             other => panic!("expected Fail, got {other:?}"),
         }
         match claude_auth_status_from_payload(file, r#"{"foo":1}"#) {
-            CheckStatus::Fail { reason, .. } => assert!(reason.contains("no claudeAiOauth"), "{reason}"),
+            CheckStatus::Fail { reason, .. } => {
+                assert!(reason.contains("no claudeAiOauth"), "{reason}")
+            }
             other => panic!("expected Fail, got {other:?}"),
         }
     }

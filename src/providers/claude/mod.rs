@@ -185,9 +185,7 @@ const MACOS_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// is kept as a fallback for items whose ACL does allow it. See issue #10.
 #[cfg(target_os = "macos")]
 fn read_macos_keychain_payload() -> Option<String> {
-    let user = std::env::var("USER")
-        .ok()
-        .filter(|u| !u.trim().is_empty());
+    let user = std::env::var("USER").ok().filter(|u| !u.trim().is_empty());
 
     // Prefer the current user's account; fall back to any account.
     for account in [user.as_deref(), None] {
@@ -217,7 +215,9 @@ fn read_macos_keychain_payload() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn security_cli_find_generic_password(account: Option<&str>) -> Option<String> {
     let mut cmd = std::process::Command::new("/usr/bin/security");
-    cmd.arg("find-generic-password").arg("-s").arg(MACOS_KEYCHAIN_SERVICE);
+    cmd.arg("find-generic-password")
+        .arg("-s")
+        .arg(MACOS_KEYCHAIN_SERVICE);
     if let Some(account) = account {
         cmd.arg("-a").arg(account);
     }
