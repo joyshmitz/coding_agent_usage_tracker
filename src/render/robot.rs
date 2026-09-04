@@ -657,7 +657,10 @@ mod tests {
 
         let daily = &parsed["data"][0]["daily"];
         assert!(daily.is_array());
-        assert_ne!(daily.as_array().unwrap().as_slice(), []);
+        assert_ne!(
+            daily.as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     #[test]

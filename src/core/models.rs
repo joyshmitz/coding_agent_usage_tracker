@@ -667,7 +667,7 @@ mod tests {
     fn credits_snapshot_from_test_utils() {
         let credits = make_test_credits_snapshot(112.50);
         assert_float_eq!(credits.remaining, 112.50);
-        assert_ne!(credits.events.as_slice(), []);
+        assert_ne!(credits.events.as_slice(), [] as [CreditEvent; 0]);
     }
 
     #[test]

@@ -1192,7 +1192,7 @@ mod tests {
         // Worst first, so the binding quota reads first.
         let labels: Vec<&str> = snapshot.scoped.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(labels, vec!["Fable", "Opus"]);
-        assert_eq!(snapshot.exhausted_scoped().as_slice(), []);
+        assert_eq!(snapshot.exhausted_scoped().len(), 0);
     }
 
     /// `is_active` marks the window binding the account right now, not the set
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(primary.window_minutes, Some(FIVE_HOUR_WINDOW_MINUTES));
         let secondary = snapshot.secondary.expect("secondary from limits[]");
         assert!((secondary.used_percent - 44.0).abs() < f64::EPSILON);
-        assert_eq!(snapshot.scoped.as_slice(), []);
+        assert_eq!(snapshot.scoped.as_slice(), [] as [ScopedWindow; 0]);
     }
 
     /// A top-level window wins over the limits[] entry for the same thing: the
@@ -1259,7 +1259,7 @@ mod tests {
         let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
         let snapshot = parse_oauth_usage_response(&response);
 
-        assert_eq!(snapshot.scoped.as_slice(), []);
+        assert_eq!(snapshot.scoped.as_slice(), [] as [ScopedWindow; 0]);
     }
 
     /// A response with no `limits[]` at all still parses, and older payloads
@@ -1270,7 +1270,7 @@ mod tests {
             serde_json::from_str(sample_usage_json()).expect("deserialize");
         let snapshot = parse_oauth_usage_response(&response);
 
-        assert_eq!(snapshot.scoped.as_slice(), []);
+        assert_eq!(snapshot.scoped.as_slice(), [] as [ScopedWindow; 0]);
         assert!(snapshot.worst_scoped().is_none());
         assert!(snapshot.tertiary.is_some());
     }

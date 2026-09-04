@@ -104,10 +104,16 @@ fn test_load_status_fixtures() {
 fn test_load_cost_fixtures() {
     let cache: serde_json::Value = load_fixture("cost/claude_stats_cache.json");
     assert_eq!(cache["version"], 1);
-    assert_ne!(cache["daily"].as_array().unwrap().as_slice(), []);
+    assert_ne!(
+        cache["daily"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 
     let events: serde_json::Value = load_fixture("cost/codex_event_log.json");
-    assert_ne!(events["events"].as_array().unwrap().as_slice(), []);
+    assert_ne!(
+        events["events"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[test]
@@ -123,7 +129,7 @@ fn test_load_token_account_fixtures() {
 
     let empty: serde_json::Value = load_fixture("token_accounts/empty.json");
     let empty_providers = empty["providers"].as_object().unwrap();
-    assert!(empty_providers.is_empty());
+    assert_eq!(empty_providers.len(), 0);
 }
 
 #[test]
@@ -250,7 +256,7 @@ fn test_cost_payload_factory() {
     assert!((cost.session_cost_usd.unwrap() - 2.50).abs() < f64::EPSILON);
     assert!((cost.last_30_days_cost_usd.unwrap() - 50.00).abs() < f64::EPSILON);
     assert_eq!(cost.session_tokens.unwrap(), 100_000);
-    assert!(!cost.daily.is_empty());
+    assert_ne!(cost.daily.len(), 0);
     assert!(cost.totals.is_some());
 }
 

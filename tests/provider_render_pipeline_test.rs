@@ -282,7 +282,10 @@ fn cost_pipeline_preserves_daily_breakdown() {
     let daily = &parsed["data"][0]["daily"];
 
     assert!(daily.is_array());
-    assert_ne!(daily.as_array().unwrap().as_slice(), []);
+    assert_ne!(
+        daily.as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 
     let first_day = &daily[0];
     assert!(first_day["date"].is_string());
@@ -383,7 +386,10 @@ fn empty_results_with_errors_only() {
     log.phase("verify");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(parsed["data"].as_array().unwrap().as_slice(), []);
+    assert_eq!(
+        parsed["data"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
     log.finish_ok();
 }
