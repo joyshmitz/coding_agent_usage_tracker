@@ -87,6 +87,17 @@ fn render_provider_usage(payload: &ProviderPayload, no_color: bool) -> String {
         ));
     }
 
+    // Model-scoped quotas (Claude's weekly Fable/Opus allowances), worst
+    // first. One of these can be spent while Session and Weekly read as idle,
+    // which is exactly when an account looks available and is not (issue #11).
+    for scoped in &payload.usage.scoped {
+        content_lines.push(format_rate_window_segments(
+            &scoped.label,
+            &scoped.window,
+            no_color,
+        ));
+    }
+
     // When no rate-limit windows are available but we DO have other info
     // (identity, credits, status), say so explicitly — otherwise the block
     // renders with no mention of the missing rate data. The modern Claude
@@ -96,7 +107,8 @@ fn render_provider_usage(payload: &ProviderPayload, no_color: bool) -> String {
     // handled by the fallback below.
     let has_any_rate_window = payload.usage.primary.is_some()
         || payload.usage.secondary.is_some()
-        || payload.usage.tertiary.is_some();
+        || payload.usage.tertiary.is_some()
+        || !payload.usage.scoped.is_empty();
     let has_any_ancillary =
         payload.credits.is_some() || payload.usage.identity.is_some() || payload.status.is_some();
     if !has_any_rate_window && has_any_ancillary {
@@ -787,6 +799,7 @@ mod tests {
                 primary: None,
                 secondary: None,
                 tertiary: None,
+                scoped: Vec::new(),
                 updated_at: chrono::Utc::now(),
                 identity: None,
             },

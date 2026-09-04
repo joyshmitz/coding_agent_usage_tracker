@@ -1014,6 +1014,7 @@ mod tests {
             }),
             secondary: None,
             tertiary: None,
+            scoped: Vec::new(),
             updated_at: at,
             identity: Some(ProviderIdentity {
                 account_email: Some("user@example.com".to_string()),

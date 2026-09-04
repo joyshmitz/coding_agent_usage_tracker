@@ -45,7 +45,7 @@ impl EnvGuard {
         for (key, value) in vars {
             let key_string = (*key).to_string();
             let existing = std::env::var(key).ok();
-            prior.push((key_string.clone(), existing));
+            prior.push((key_string, existing));
 
             unsafe {
                 match value {

@@ -612,11 +612,9 @@ async fn fetch_json_claude_rate_limit_format() {
         .expect("fetch should succeed");
 
     log.phase("verify");
-    assert!(
-        result["rate_limit"]["requests"]["remaining"]
-            .as_i64()
-            .unwrap()
-            == 70
+    assert_eq!(
+        result["rate_limit"]["requests"]["remaining"].as_i64(),
+        Some(70)
     );
     log.finish_ok();
 }
@@ -658,7 +656,7 @@ async fn fetch_json_openai_rate_limit_format() {
         .expect("fetch should succeed");
 
     log.phase("verify");
-    assert!(result["user"]["email"].as_str().unwrap() == "test@example.com");
+    assert_eq!(result["user"]["email"].as_str(), Some("test@example.com"));
     log.finish_ok();
 }
 

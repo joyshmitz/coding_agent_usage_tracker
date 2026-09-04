@@ -110,6 +110,7 @@ pub fn usage_snapshot(primary_pct: f64, secondary_pct: Option<f64>) -> UsageSnap
         primary: Some(rate_window(primary_pct, 180)),
         secondary: secondary_pct.map(|pct| rate_window(pct, 10080)),
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: Utc::now(),
         identity: Some(ProviderIdentity {
             account_email: Some("test@example.com".to_string()),
@@ -132,6 +133,7 @@ pub fn usage_snapshot_full(
         primary: Some(rate_window(primary_pct, 180)),
         secondary: Some(rate_window(secondary_pct, 10080)),
         tertiary: Some(rate_window(tertiary_pct, 10080)),
+        scoped: Vec::new(),
         updated_at: Utc::now(),
         identity: Some(ProviderIdentity {
             account_email: Some("test@example.com".to_string()),
@@ -473,7 +475,7 @@ mod tests {
     fn credits_factory() {
         let credits = credits_snapshot(75.0);
         assert!((credits.remaining - 75.0).abs() < f64::EPSILON);
-        assert!(!credits.events.is_empty());
+        assert_eq!(credits.events.len(), 2);
     }
 
     #[test]

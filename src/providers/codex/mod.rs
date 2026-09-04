@@ -487,6 +487,7 @@ pub async fn fetch_cli() -> Result<UsageSnapshot> {
         primary: None,
         secondary: None,
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: now,
         identity,
     })
@@ -557,6 +558,7 @@ fn parse_rate_limit_response(
         primary,
         secondary,
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: now,
         identity,
     }

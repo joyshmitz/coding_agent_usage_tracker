@@ -192,7 +192,7 @@ impl<'a> UsageTable<'a> {
             rows.push(vec![
                 Segment::styled(provider_name, provider_style.clone()),
                 Segment::styled(session, row_style.clone()),
-                Segment::styled(weekly, row_style.clone()),
+                Segment::styled(weekly, row_style),
                 Segment::styled(credits, self.theme.cost.clone()),
                 Segment::styled(status_text.to_string(), status_style),
             ]);

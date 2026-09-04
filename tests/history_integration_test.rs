@@ -37,6 +37,7 @@ fn make_snapshot(at: chrono::DateTime<Utc>, primary_pct: f64) -> UsageSnapshot {
         }),
         secondary: None,
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: at,
         identity: Some(ProviderIdentity {
             account_email: Some("test@example.com".to_string()),
@@ -72,6 +73,7 @@ fn make_full_snapshot(
             resets_at: Some(at + Duration::days(7)),
             reset_description: Some("Opus tier".to_string()),
         }),
+        scoped: Vec::new(),
         updated_at: at,
         identity: Some(ProviderIdentity {
             account_email: Some("claude@example.com".to_string()),
@@ -875,6 +877,7 @@ fn test_snapshot_with_no_identity() {
         }),
         secondary: None,
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: now,
         identity: None,
     };
@@ -905,6 +908,7 @@ fn test_snapshot_with_no_rate_windows() {
         primary: None,
         secondary: None,
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: now,
         identity: Some(ProviderIdentity {
             account_email: Some("test@test.com".to_string()),

@@ -76,6 +76,20 @@ pub fn render_usage_md(results: &[ProviderPayload]) -> Result<String> {
             }
         }
 
+        // Model-scoped quotas: one of these can be spent while session and
+        // weekly still read as idle (issue #11).
+        for scoped in &payload.usage.scoped {
+            let _ = writeln!(
+                output,
+                "- scoped_left[{}]: {:.0}%",
+                scoped.label,
+                scoped.window.remaining_percent()
+            );
+            if let Some(resets_at) = &scoped.window.resets_at {
+                let _ = writeln!(output, "- resets_scoped[{}]: {resets_at}", scoped.label);
+            }
+        }
+
         if let Some(credits) = &payload.credits {
             let _ = writeln!(output, "- credits_left: {:.1}", credits.remaining);
         }
@@ -643,7 +657,7 @@ mod tests {
 
         let daily = &parsed["data"][0]["daily"];
         assert!(daily.is_array());
-        assert!(!daily.as_array().unwrap().is_empty());
+        assert_ne!(daily.as_array().unwrap().as_slice(), []);
     }
 
     #[test]

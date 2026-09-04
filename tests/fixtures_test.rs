@@ -104,10 +104,10 @@ fn test_load_status_fixtures() {
 fn test_load_cost_fixtures() {
     let cache: serde_json::Value = load_fixture("cost/claude_stats_cache.json");
     assert_eq!(cache["version"], 1);
-    assert!(!cache["daily"].as_array().unwrap().is_empty());
+    assert_ne!(cache["daily"].as_array().unwrap().as_slice(), []);
 
     let events: serde_json::Value = load_fixture("cost/codex_event_log.json");
-    assert!(!events["events"].as_array().unwrap().is_empty());
+    assert_ne!(events["events"].as_array().unwrap().as_slice(), []);
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn test_status_payload_factory() {
 fn test_credits_snapshot_factory() {
     let credits = credits_snapshot(75.0);
     assert!((credits.remaining - 75.0).abs() < f64::EPSILON);
-    assert!(!credits.events.is_empty());
+    assert_eq!(credits.events.len(), 2);
     // Should have purchase and usage events
     assert!(credits.events.iter().any(|e| e.event_type == "purchase"));
     assert!(credits.events.iter().any(|e| e.event_type == "usage"));

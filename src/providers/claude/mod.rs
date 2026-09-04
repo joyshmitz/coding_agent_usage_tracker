@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::core::cli_runner::{CLI_TIMEOUT, run_command, run_json_command};
 use crate::core::fetch_plan::{FetchKind, FetchPlan, FetchStrategy};
 use crate::core::http::{DEFAULT_TIMEOUT, build_client};
-use crate::core::models::{ProviderIdentity, RateWindow, UsageSnapshot};
+use crate::core::models::{ProviderIdentity, RateWindow, ScopedWindow, UsageSnapshot};
 use crate::core::provider::Provider;
 use crate::error::{CautError, Result};
 
@@ -453,6 +453,92 @@ struct ClaudeOauthUsageResponse {
     seven_day_opus: Option<ClaudeUsageWindow>,
     #[serde(default)]
     seven_day_sonnet: Option<ClaudeUsageWindow>,
+    /// One entry per rate limit window, including the `weekly_scoped`
+    /// per-model allowances that have no top-level field of their own. Without
+    /// these an account whose Fable quota is spent reads as idle (issue #11).
+    #[serde(default)]
+    limits: Vec<ClaudeLimit>,
+}
+
+/// One entry of the usage response's `limits[]` array.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ClaudeLimit {
+    /// `session`, `weekly_all` or `weekly_scoped`.
+    #[serde(default)]
+    kind: Option<String>,
+    /// `session` or `weekly`; the window length this limit is measured over.
+    #[serde(default)]
+    group: Option<String>,
+    /// Percent of the allowance consumed, 0-100.
+    #[serde(default)]
+    percent: Option<f64>,
+    /// The provider's own grading: `normal`, `warning`, `critical`.
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    resets_at: Option<String>,
+    /// Present when the limit binds one model (or surface) rather than the
+    /// whole account.
+    #[serde(default)]
+    scope: Option<ClaudeLimitScope>,
+    /// Set on the limit currently binding the account — not on the set of
+    /// limits that apply, so it must not be used to filter entries out.
+    #[serde(default)]
+    is_active: bool,
+}
+
+/// The `scope` object of a `limits[]` entry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ClaudeLimitScope {
+    #[serde(default)]
+    model: Option<ClaudeLimitModel>,
+}
+
+/// The model a scoped limit applies to. `id` is currently always null in the
+/// responses observed, so the display name is the usable identifier.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ClaudeLimitModel {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+impl ClaudeLimit {
+    /// The model this limit is scoped to, or `None` when it applies to the
+    /// whole account.
+    fn model_label(&self) -> Option<String> {
+        let model = self.scope.as_ref()?.model.as_ref()?;
+        model
+            .display_name
+            .as_ref()
+            .or(model.id.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The window length this limit is measured over, in minutes.
+    fn window_minutes(&self) -> Option<i32> {
+        match self.group.as_deref() {
+            Some("session") => Some(FIVE_HOUR_WINDOW_MINUTES),
+            Some("weekly") => Some(SEVEN_DAY_WINDOW_MINUTES),
+            _ => None,
+        }
+    }
+
+    /// Render this limit as a [`RateWindow`].
+    fn rate_window(&self) -> RateWindow {
+        let resets_at = self.resets_at.as_ref().and_then(|s| s.parse().ok());
+        RateWindow {
+            used_percent: self.percent.unwrap_or(0.0),
+            window_minutes: self.window_minutes(),
+            resets_at,
+            reset_description: resets_at.map(crate::util::time::format_countdown),
+        }
+    }
 }
 
 /// A single usage window from the OAuth usage endpoint.
@@ -604,6 +690,7 @@ pub async fn fetch_cli() -> Result<UsageSnapshot> {
         primary: None,
         secondary: None,
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: now,
         identity,
     })
@@ -669,17 +756,53 @@ fn parse_usage_window(
 fn parse_oauth_usage_response(response: &ClaudeOauthUsageResponse) -> UsageSnapshot {
     let now = Utc::now();
 
-    let primary = parse_usage_window(response.five_hour.as_ref(), FIVE_HOUR_WINDOW_MINUTES);
-    let secondary = parse_usage_window(response.seven_day.as_ref(), SEVEN_DAY_WINDOW_MINUTES);
+    let mut primary = parse_usage_window(response.five_hour.as_ref(), FIVE_HOUR_WINDOW_MINUTES);
+    let mut secondary = parse_usage_window(response.seven_day.as_ref(), SEVEN_DAY_WINDOW_MINUTES);
     let tertiary = parse_usage_window(response.seven_day_opus.as_ref(), SEVEN_DAY_WINDOW_MINUTES)
         .or_else(|| {
             parse_usage_window(response.seven_day_sonnet.as_ref(), SEVEN_DAY_WINDOW_MINUTES)
         });
 
+    // `limits[]` is the current shape. Every entry is read, not only the ones
+    // flagged `is_active`: that flag marks the window binding the account right
+    // now, so filtering on it would drop the general windows exactly when a
+    // scoped quota is the one that is spent (issue #11).
+    let mut scoped = Vec::new();
+    for limit in &response.limits {
+        if let Some(label) = limit.model_label() {
+            scoped.push(ScopedWindow {
+                label,
+                kind: limit.kind.clone(),
+                severity: limit.severity.clone(),
+                is_active: limit.is_active,
+                window: limit.rate_window(),
+            });
+            continue;
+        }
+        // Account-wide entries backfill the top-level windows for responses
+        // that report them only here.
+        match limit.kind.as_deref() {
+            Some("session") if primary.is_none() => primary = Some(limit.rate_window()),
+            Some("weekly_all") if secondary.is_none() => secondary = Some(limit.rate_window()),
+            _ => {}
+        }
+    }
+
+    // Worst first, so the quota that decides whether the account is usable is
+    // the one a reader sees first.
+    scoped.sort_by(|a, b| {
+        b.window
+            .used_percent
+            .partial_cmp(&a.window.used_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+
     UsageSnapshot {
         primary,
         secondary,
         tertiary,
+        scoped,
         updated_at: now,
         identity: Some(local_identity_with_method("oauth")),
     }
@@ -722,6 +845,7 @@ fn parse_cli_limits_output(output: &str) -> UsageSnapshot {
         primary,
         secondary,
         tertiary: None,
+        scoped: Vec::new(),
         updated_at: now,
         identity: Some(ProviderIdentity {
             account_email: None,
@@ -908,7 +1032,7 @@ mod tests {
         assert_eq!(primary.window_minutes, Some(FIVE_HOUR_WINDOW_MINUTES));
         assert!(primary.resets_at.is_some());
         let desc = primary.reset_description.expect("reset description");
-        assert!(!desc.is_empty());
+        assert_ne!(desc.as_str(), "");
 
         // Secondary = seven_day.
         let secondary = snapshot.secondary.expect("secondary");
@@ -989,6 +1113,181 @@ mod tests {
         // itself must survive.
         assert!(primary.resets_at.is_none());
         assert!(primary.reset_description.is_none());
+    }
+
+    // =========================================================================
+    // Model-Scoped Quota Tests (issue #11)
+    // =========================================================================
+
+    /// The routing-risk case: the general windows are below threshold while the
+    /// weekly Fable allowance is spent, so the account looks available and is
+    /// not. Shape taken from a real `GET /api/oauth/usage` response.
+    fn exhausted_fable_json() -> &'static str {
+        r#"{
+            "five_hour": {"utilization": 0.0, "resets_at": "2030-01-01T05:00:00Z"},
+            "seven_day": {"utilization": 56.0, "resets_at": "2030-01-04T00:00:00Z"},
+            "seven_day_opus": null,
+            "seven_day_sonnet": null,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 0, "severity": "normal",
+                 "resets_at": "2030-01-01T05:00:00Z", "scope": null, "is_active": false},
+                {"kind": "weekly_all", "group": "weekly", "percent": 56, "severity": "normal",
+                 "resets_at": "2030-01-04T00:00:00Z", "scope": null, "is_active": false},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 100, "severity": "critical",
+                 "resets_at": "2030-01-04T19:59:59Z",
+                 "scope": {"model": {"display_name": "Fable", "id": null}, "surface": null},
+                 "is_active": true}
+            ]
+        }"#
+    }
+
+    #[test]
+    fn parse_usage_response_exposes_scoped_quota() {
+        let response: ClaudeOauthUsageResponse =
+            serde_json::from_str(exhausted_fable_json()).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        // The general windows are unchanged and still look healthy.
+        let primary = snapshot.primary.as_ref().expect("primary");
+        assert!(primary.used_percent.abs() < f64::EPSILON);
+        let secondary = snapshot.secondary.as_ref().expect("secondary");
+        assert!((secondary.used_percent - 56.0).abs() < f64::EPSILON);
+
+        // The scoped quota is what says the account cannot do Fable work.
+        assert_eq!(snapshot.scoped.len(), 1);
+        let fable = &snapshot.scoped[0];
+        assert_eq!(fable.label, "Fable");
+        assert_eq!(fable.kind.as_deref(), Some("weekly_scoped"));
+        assert_eq!(fable.severity.as_deref(), Some("critical"));
+        assert!(fable.is_active);
+        assert!((fable.window.used_percent - 100.0).abs() < f64::EPSILON);
+        assert_eq!(fable.window.window_minutes, Some(SEVEN_DAY_WINDOW_MINUTES));
+        assert!(fable.window.resets_at.is_some());
+        assert!(fable.window.reset_description.is_some());
+        assert!(fable.is_exhausted());
+        assert!(fable.is_near_limit(80.0));
+
+        assert_eq!(
+            snapshot.worst_scoped().map(|s| s.label.as_str()),
+            Some("Fable")
+        );
+        assert_eq!(snapshot.exhausted_scoped().len(), 1);
+    }
+
+    #[test]
+    fn parse_usage_response_keeps_healthy_scoped_quotas() {
+        let json = r#"{
+            "five_hour": {"utilization": 71.0},
+            "seven_day": {"utilization": 56.0},
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 5, "severity": "normal",
+                 "scope": {"model": {"display_name": "Fable"}}, "is_active": false},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "severity": "normal",
+                 "scope": {"model": {"display_name": "Opus"}}, "is_active": false}
+            ]
+        }"#;
+        let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        // Worst first, so the binding quota reads first.
+        let labels: Vec<&str> = snapshot.scoped.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["Fable", "Opus"]);
+        assert_eq!(snapshot.exhausted_scoped().as_slice(), []);
+    }
+
+    /// `is_active` marks the window binding the account right now, not the set
+    /// of windows that apply — filtering on it would drop the general windows
+    /// exactly when a scoped quota is spent.
+    #[test]
+    fn parse_usage_response_keeps_inactive_limits() {
+        let response: ClaudeOauthUsageResponse =
+            serde_json::from_str(exhausted_fable_json()).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        assert!(snapshot.primary.is_some(), "inactive session limit dropped");
+        assert!(
+            snapshot.secondary.is_some(),
+            "inactive weekly limit dropped"
+        );
+    }
+
+    /// Accounts that report the general windows only through `limits[]`.
+    #[test]
+    fn parse_usage_response_backfills_windows_from_limits() {
+        let json = r#"{
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 33, "resets_at": "2030-01-01T05:00:00Z"},
+                {"kind": "weekly_all", "group": "weekly", "percent": 44}
+            ]
+        }"#;
+        let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        let primary = snapshot.primary.expect("primary from limits[]");
+        assert!((primary.used_percent - 33.0).abs() < f64::EPSILON);
+        assert_eq!(primary.window_minutes, Some(FIVE_HOUR_WINDOW_MINUTES));
+        let secondary = snapshot.secondary.expect("secondary from limits[]");
+        assert!((secondary.used_percent - 44.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.scoped.as_slice(), []);
+    }
+
+    /// A top-level window wins over the limits[] entry for the same thing: the
+    /// former carries a float utilization, the latter a rounded percent.
+    #[test]
+    fn parse_usage_response_prefers_top_level_precision() {
+        let json = r#"{
+            "five_hour": {"utilization": 33.7},
+            "limits": [{"kind": "session", "group": "session", "percent": 34}]
+        }"#;
+        let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        let primary = snapshot.primary.expect("primary");
+        assert!((primary.used_percent - 33.7).abs() < f64::EPSILON);
+    }
+
+    /// A limit scoped to something other than a model (a surface) is not a
+    /// model quota and must not be reported as one.
+    #[test]
+    fn parse_usage_response_ignores_non_model_scopes() {
+        let json = r#"{
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 90,
+                 "scope": {"model": null, "surface": {"display_name": "Claude Code"}}}
+            ]
+        }"#;
+        let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        assert_eq!(snapshot.scoped.as_slice(), []);
+    }
+
+    /// A response with no `limits[]` at all still parses, and older payloads
+    /// keep the behavior they had.
+    #[test]
+    fn parse_usage_response_without_limits_is_unchanged() {
+        let response: ClaudeOauthUsageResponse =
+            serde_json::from_str(sample_usage_json()).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        assert_eq!(snapshot.scoped.as_slice(), []);
+        assert!(snapshot.worst_scoped().is_none());
+        assert!(snapshot.tertiary.is_some());
+    }
+
+    #[test]
+    fn scoped_quota_survives_json_round_trip() {
+        let response: ClaudeOauthUsageResponse =
+            serde_json::from_str(exhausted_fable_json()).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        let json = serde_json::to_value(&snapshot).expect("serialize");
+        let scoped = json["scoped"].as_array().expect("scoped array");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0]["label"], "Fable");
+        assert_eq!(scoped[0]["severity"], "critical");
+        assert_eq!(scoped[0]["isActive"], true);
+        assert!((scoped[0]["window"]["usedPercent"].as_f64().expect("pct") - 100.0).abs() < 1e-9);
     }
 
     // =========================================================================

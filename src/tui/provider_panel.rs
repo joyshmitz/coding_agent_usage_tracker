@@ -93,6 +93,21 @@ impl<'a> ProviderPanel<'a> {
             ]));
         }
 
+        // Model-scoped quotas (Claude's weekly Fable/Opus allowances), worst
+        // first. One of these can be spent while Session and Weekly still read
+        // as idle, which is when an account looks available and is not (#11).
+        for scoped in &usage.scoped {
+            let remaining = scoped.window.remaining_percent();
+            let color = Self::usage_color(remaining);
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:<9}", format!("{}:", scoped.label))),
+                Span::styled(
+                    format!("{remaining:.0}%"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+
         // Identity info
         if let Some(identity) = &usage.identity
             && let Some(email) = &identity.account_email

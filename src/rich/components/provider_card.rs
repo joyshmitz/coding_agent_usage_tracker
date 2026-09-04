@@ -146,6 +146,12 @@ impl<'a> ProviderCard<'a> {
             lines.push(self.render_rate_window_segments(tertiary, "Tier"));
         }
 
+        // Model-scoped quotas, worst first: one can be spent while Session and
+        // Weekly still read as idle (issue #11).
+        for scoped in &self.payload.usage.scoped {
+            lines.push(self.render_rate_window_segments(&scoped.window, &scoped.label));
+        }
+
         // Credits info (Codex)
         if let Some(credits) = &self.payload.credits {
             let mut credit_line = Vec::new();
@@ -270,6 +276,10 @@ impl Renderable for ProviderCard<'_> {
 
         if let Some(tertiary) = &self.payload.usage.tertiary {
             lines.push(self.render_rate_window_plain(tertiary, "Tier"));
+        }
+
+        for scoped in &self.payload.usage.scoped {
+            lines.push(self.render_rate_window_plain(&scoped.window, &scoped.label));
         }
 
         // Credits

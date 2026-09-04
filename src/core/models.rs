@@ -90,6 +90,13 @@ pub struct UsageSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tertiary: Option<RateWindow>,
 
+    /// Model-scoped quotas: allowances that bind one model rather than the
+    /// account as a whole. Anthropic reports a weekly Fable and Opus
+    /// allowance this way, and either can be spent while the session and
+    /// weekly windows still read as idle (issue #11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped: Vec<ScopedWindow>,
+
     /// When this snapshot was captured.
     pub updated_at: DateTime<Utc>,
 
@@ -106,9 +113,81 @@ impl UsageSnapshot {
             primary: Some(primary),
             secondary: None,
             tertiary: None,
+            scoped: Vec::new(),
             updated_at: Utc::now(),
             identity: None,
         }
+    }
+
+    /// The model-scoped quota closest to its cap, if any.
+    ///
+    /// This is the one that decides whether the account can still do work on
+    /// the model it is scoped to — the figure the session and weekly windows
+    /// cannot tell you.
+    #[must_use]
+    pub fn worst_scoped(&self) -> Option<&ScopedWindow> {
+        self.scoped.iter().max_by(|a, b| {
+            a.window
+                .used_percent
+                .partial_cmp(&b.window.used_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+
+    /// Every model-scoped quota that is spent.
+    #[must_use]
+    pub fn exhausted_scoped(&self) -> Vec<&ScopedWindow> {
+        self.scoped.iter().filter(|s| s.is_exhausted()).collect()
+    }
+}
+
+// =============================================================================
+// Model-Scoped Window
+// =============================================================================
+
+/// A quota that applies to one model rather than to the account as a whole.
+///
+/// Anthropic reports these in the usage response's `limits[]` array as
+/// `weekly_scoped` entries carrying the model's display name. An account can
+/// have a scoped allowance at 100% while its session and weekly windows are
+/// nearly empty, which is exactly when it looks available and is not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedWindow {
+    /// The model this quota is scoped to, as the provider labels it
+    /// (e.g. "Fable", "Opus").
+    pub label: String,
+
+    /// The provider's name for the window, e.g. `weekly_scoped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+
+    /// The provider's own grading: `normal`, `warning` or `critical`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+
+    /// Whether the provider flagged this as the window currently binding the
+    /// account. It marks the limit that is biting right now, not the set of
+    /// limits that apply, so it must not be used to filter entries out.
+    #[serde(default)]
+    pub is_active: bool,
+
+    /// Utilization, reset time and window length, in the shape every other
+    /// window uses.
+    pub window: RateWindow,
+}
+
+impl ScopedWindow {
+    /// Whether this quota is spent.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.window.used_percent >= 100.0
+    }
+
+    /// Whether this quota is at or above `threshold` percent.
+    #[must_use]
+    pub fn is_near_limit(&self, threshold: f64) -> bool {
+        self.window.used_percent >= threshold
     }
 }
 
@@ -588,7 +667,7 @@ mod tests {
     fn credits_snapshot_from_test_utils() {
         let credits = make_test_credits_snapshot(112.50);
         assert_float_eq!(credits.remaining, 112.50);
-        assert!(!credits.events.is_empty());
+        assert_ne!(credits.events.as_slice(), []);
     }
 
     #[test]
