@@ -484,8 +484,9 @@ struct ClaudeLimit {
     scope: Option<ClaudeLimitScope>,
     /// Set on the limit currently binding the account — not on the set of
     /// limits that apply, so it must not be used to filter entries out.
+    /// Optional so an explicit `null` cannot fail the whole response.
     #[serde(default)]
-    is_active: bool,
+    is_active: Option<bool>,
 }
 
 /// The `scope` object of a `limits[]` entry.
@@ -529,15 +530,22 @@ impl ClaudeLimit {
         }
     }
 
-    /// Render this limit as a [`RateWindow`].
-    fn rate_window(&self) -> RateWindow {
+    /// Render this limit as a [`RateWindow`], or `None` when it carries no
+    /// percentage.
+    ///
+    /// A limit with no `percent` says nothing about how much is left, and
+    /// reporting it as 0% would be the very failure this parsing exists to
+    /// prevent — an unknown quota reading as spare capacity. Skipping it
+    /// matches how the top-level windows treat a missing `utilization`.
+    fn rate_window(&self) -> Option<RateWindow> {
+        let used_percent = self.percent?;
         let resets_at = self.resets_at.as_ref().and_then(|s| s.parse().ok());
-        RateWindow {
-            used_percent: self.percent.unwrap_or(0.0),
+        Some(RateWindow {
+            used_percent,
             window_minutes: self.window_minutes(),
             resets_at,
             reset_description: resets_at.map(crate::util::time::format_countdown),
-        }
+        })
     }
 }
 
@@ -769,21 +777,24 @@ fn parse_oauth_usage_response(response: &ClaudeOauthUsageResponse) -> UsageSnaps
     // scoped quota is the one that is spent (issue #11).
     let mut scoped = Vec::new();
     for limit in &response.limits {
+        let Some(window) = limit.rate_window() else {
+            continue; // no percentage: nothing this entry can tell us
+        };
         if let Some(label) = limit.model_label() {
             scoped.push(ScopedWindow {
                 label,
                 kind: limit.kind.clone(),
                 severity: limit.severity.clone(),
-                is_active: limit.is_active,
-                window: limit.rate_window(),
+                is_active: limit.is_active.unwrap_or(false),
+                window,
             });
             continue;
         }
         // Account-wide entries backfill the top-level windows for responses
         // that report them only here.
         match limit.kind.as_deref() {
-            Some("session") if primary.is_none() => primary = Some(limit.rate_window()),
-            Some("weekly_all") if secondary.is_none() => secondary = Some(limit.rate_window()),
+            Some("session") if primary.is_none() => primary = Some(window),
+            Some("weekly_all") if secondary.is_none() => secondary = Some(window),
             _ => {}
         }
     }
@@ -1273,6 +1284,58 @@ mod tests {
         assert_eq!(snapshot.scoped.as_slice(), [] as [ScopedWindow; 0]);
         assert!(snapshot.worst_scoped().is_none());
         assert!(snapshot.tertiary.is_some());
+    }
+
+    /// A limit with no `percent` says nothing about remaining capacity, and
+    /// must not be reported as 0% used.
+    #[test]
+    fn parse_usage_response_skips_limits_without_a_percentage() {
+        let json = r#"{
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "severity": "normal",
+                 "scope": {"model": {"display_name": "Fable"}}, "is_active": true},
+                {"kind": "session", "group": "session"}
+            ]
+        }"#;
+        let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        assert_eq!(snapshot.scoped.as_slice(), [] as [ScopedWindow; 0]);
+        assert!(snapshot.primary.is_none());
+    }
+
+    /// An explicit `null` in a field the API normally sends as a bool must not
+    /// fail the whole response.
+    #[test]
+    fn parse_usage_response_tolerates_null_is_active() {
+        let json = r#"{
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 100, "is_active": null,
+                 "scope": {"model": {"display_name": "Fable"}}}
+            ]
+        }"#;
+        let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        assert_eq!(snapshot.scoped.len(), 1);
+        assert!(!snapshot.scoped[0].is_active);
+        assert!(snapshot.scoped[0].is_exhausted());
+    }
+
+    /// The model `id` stands in when the API sends no display name.
+    #[test]
+    fn parse_usage_response_falls_back_to_model_id() {
+        let json = r#"{
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 40,
+                 "scope": {"model": {"id": "claude-fable-5", "display_name": null}}}
+            ]
+        }"#;
+        let response: ClaudeOauthUsageResponse = serde_json::from_str(json).expect("deserialize");
+        let snapshot = parse_oauth_usage_response(&response);
+
+        assert_eq!(snapshot.scoped.len(), 1);
+        assert_eq!(snapshot.scoped[0].label, "claude-fable-5");
     }
 
     #[test]
